@@ -59,6 +59,28 @@ wss.on('connection', (ws, req) => {
           broadcastToAll(data, ws);
           break;
           
+        case 'follow':
+          // Notify only the followed user
+          clients.forEach((clientInfo, client) => {
+            if (
+              clientInfo.userId === data.followedId &&
+              client.readyState === WebSocket.OPEN
+            ) {
+              try {
+                client.send(JSON.stringify({
+                  type: 'follow',
+                  followerId: data.followerId,
+                  followedId: data.followedId,
+                  timestamp: data.timestamp
+                }));
+                console.log(`👥 Follow notification sent to user ${data.followedId} from ${data.followerId}`);
+              } catch (error) {
+                console.error('❌ Error sending follow notification:', error);
+              }
+            }
+          });
+          break;
+          
         default:
           // Broadcast other message types to all clients
           broadcastToAll(data, ws);
