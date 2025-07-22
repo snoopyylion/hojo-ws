@@ -61,7 +61,7 @@ async function saveNotification({ user_id, type, title, message, data }) {
     if (!frontendApiUrl) {
       throw new Error('FRONTEND_API_URL is not set in environment variables');
     }
-    const url = `${frontendApiUrl}/notifications`;
+    const url = `${frontendApiUrl.replace(/\/$/, '')}/api/notifications`;
     console.log('Saving notification to:', url);
     const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
     const res = await fetch(url, {
