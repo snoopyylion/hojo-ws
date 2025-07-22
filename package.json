@@ -8,6 +8,9 @@
     "dev": "node server.js"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.52.0",
+    "dotenv": "^17.2.0",
+    "node-fetch": "^3.3.2",
     "ws": "^8.18.2"
   },
   "engines": {

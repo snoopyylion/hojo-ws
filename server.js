@@ -1,5 +1,10 @@
 // server.js
+
+require('dotenv').config();
+
 const WebSocket = require('ws');
+const { createClient } = require('@supabase/supabase-js');
+const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 
 const wss = new WebSocket.Server({ port: 4001 }, () => {
   console.log('✅ WebSocket server running on ws://localhost:4001');
@@ -8,84 +13,202 @@ const wss = new WebSocket.Server({ port: 4001 }, () => {
 // Store connected clients with their info
 const clients = new Map();
 
+// Track active users in conversations
+const activeConversationUsers = {}; // { [conversationId]: Set<userId> }
+
+async function saveMessageNotificationsForAll(message) {
+  console.log('saveMessageNotificationsForAll called for message:', message);
+  const { data: participants, error } = await supabase
+    .from('conversation_participants')
+    .select('user_id')
+    .eq('conversation_id', message.conversation_id)
+    .is('left_at', null);
+
+  if (error) {
+    console.error('Error fetching participants:', error);
+    return;
+  }
+
+  console.log('Participants for conversation:', participants);
+
+  for (const participant of participants) {
+    if (participant.user_id !== message.sender_id) {
+      console.log('Saving message notification for:', participant.user_id);
+      await saveNotification({
+        user_id: participant.user_id,
+        type: 'message',
+        title: `New message from ${message.sender?.first_name || message.sender?.username || 'Someone'}`,
+        message: message.content || 'New message',
+        data: {
+          conversation_id: message.conversation_id,
+          senderId: message.sender_id
+        },
+      });
+    }
+  }
+}
+
+async function saveNotification({ user_id, type, title, message, data }) {
+  try {
+    const frontendApiUrl = process.env.FRONTEND_API_URL;
+    if (!frontendApiUrl) {
+      throw new Error('FRONTEND_API_URL is not set in environment variables');
+    }
+    const url = `${frontendApiUrl}/notifications`;
+    console.log('Saving notification to:', url);
+    const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-server-call': 'true',
+      },
+      body: JSON.stringify({
+        user_id,
+        type,
+        title,
+        message,
+        data,
+      }),
+    });
+    const text = await res.text();
+    console.log('Notification save response:', res.status, text);
+  } catch (error) {
+    console.error('Failed to save notification:', error);
+  }
+}
+
+// Helper to get socket for a specific user
+function getSocketForUser(userId) {
+  for (const [socket, clientInfo] of clients) {
+    if (clientInfo.userId === userId && socket.readyState === WebSocket.OPEN) {
+      return socket;
+    }
+  }
+  return null;
+}
+
 wss.on('connection', (ws, req) => {
   console.log('🔌 New client connected');
-  
+
   // Extract conversation ID and user ID from URL if available
   const url = new URL(req.url, 'http://localhost:4001');
   const conversationId = url.pathname.split('/conversations/')[1]?.split('?')[0];
   const userId = url.searchParams.get('userId');
-  
+
+  // Track active users in conversation
+  if (conversationId && userId) {
+    if (!activeConversationUsers[conversationId]) {
+      activeConversationUsers[conversationId] = new Set();
+    }
+    activeConversationUsers[conversationId].add(userId);
+  }
+
   // Store client info
   clients.set(ws, {
     conversationId,
     userId,
     connectedAt: Date.now()
   });
-  
+
   console.log(`👤 User ${userId} joined conversation ${conversationId}`);
 
-  ws.on('message', (message) => {
+  ws.on('message', async (message) => {
     try {
       // Convert Buffer to string
       const messageStr = message.toString();
       console.log('📨 Message received:', messageStr);
-      
+
       // Parse the JSON message
       const data = JSON.parse(messageStr);
-      
+
       // Get sender info
       const senderInfo = clients.get(ws);
-      
+
       // Add sender info to the message if not present
       if (senderInfo && !data.userId) {
         data.userId = senderInfo.userId;
       }
-      
+
       // Broadcast logic based on message type
       switch (data.type) {
         case 'typing_update':
           // Only send typing updates to clients in the same conversation
           broadcastToConversation(data.conversationId, data, ws);
           break;
-          
-        case 'new_message':
-          // Broadcast new messages to all clients in the conversation
-          broadcastToConversation(data.message?.conversation_id, data, ws);
-          break;
-          
+
         case 'user_presence':
           // Broadcast presence updates to all clients
           broadcastToAll(data, ws);
           break;
-          
         case 'follow':
-          // Notify only the followed user
+          // Only process actual follow actions (not unfollow)
+          if (data.action === 'follow') {
+            console.log('Processing follow notification for:', data.followedId);
+
+            // 1. Save notification for the followed user
+            await saveNotification({
+              user_id: data.followedId,
+              type: 'follow',
+              title: 'New Follower',
+              message: `${data.followerName || 'Someone'} started following you!`,
+              data: {
+                followerId: data.followerId,
+                action: data.action,
+                timestamp: data.timestamp
+              },
+            });
+
+            // 2. Broadcast to the followed user if online
+            const followedSocket = getSocketForUser(data.followedId);
+            if (followedSocket) {
+              const notification = {
+                type: 'follow_notification',
+                followerId: data.followerId,
+                followedId: data.followedId,
+                followerName: data.followerName,
+                action: data.action,
+                timestamp: data.timestamp || Date.now()
+              };
+
+              followedSocket.send(JSON.stringify(notification));
+              console.log(`👥 Follow notification sent to user ${data.followedId}`);
+            } else {
+              console.log(`👤 User ${data.followedId} is not online, notification saved only`);
+            }
+          }
+          break;
+
+        case 'new_message':
+          // 1. Save notification for all participants (offline notification)
+          await saveMessageNotificationsForAll(data.message);
+
+          // 2. Broadcast instant notification to all connected clients (except sender)
           clients.forEach((clientInfo, client) => {
             if (
-              clientInfo.userId === data.followedId &&
+              clientInfo.conversationId === data.message.conversation_id &&
+              clientInfo.userId !== data.message.sender_id &&
               client.readyState === WebSocket.OPEN
             ) {
-              try {
-                client.send(JSON.stringify({
-                  type: 'follow',
-                  followerId: data.followerId,
-                  followedId: data.followedId,
-                  timestamp: data.timestamp
-                }));
-                console.log(`👥 Follow notification sent to user ${data.followedId} from ${data.followerId}`);
-              } catch (error) {
-                console.error('❌ Error sending follow notification:', error);
-              }
+              client.send(JSON.stringify({
+                type: 'new_message',
+                senderName: data.message.sender?.username || 'Someone',
+                content: data.message.content,
+                conversationId: data.message.conversation_id,
+                messageId: data.message.id
+              }));
             }
           });
+
+          // 3. (Optional) Broadcast the message itself as you already do
+          broadcastToConversation(data.message?.conversation_id, data, ws);
           break;
-          
+
         default:
           // Broadcast other message types to all clients
           broadcastToAll(data, ws);
       }
-      
+
     } catch (error) {
       console.error('❌ Error processing message:', error);
       console.error('Raw message:', message);
@@ -93,9 +216,15 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('close', () => {
+    if (conversationId && userId && activeConversationUsers[conversationId]) {
+      activeConversationUsers[conversationId].delete(userId);
+      if (activeConversationUsers[conversationId].size === 0) {
+        delete activeConversationUsers[conversationId];
+      }
+    }
     const clientInfo = clients.get(ws);
     console.log(`❌ Client disconnected: User ${clientInfo?.userId} from conversation ${clientInfo?.conversationId}`);
-    
+
     // Send offline status to other clients
     if (clientInfo?.userId) {
       broadcastToAll({
@@ -104,14 +233,14 @@ wss.on('connection', (ws, req) => {
         isOnline: false
       }, ws);
     }
-    
+
     clients.delete(ws);
   });
-  
+
   ws.on('error', (error) => {
     console.error('❌ WebSocket error:', error);
   });
-  
+
   // Send online status to other clients
   if (userId) {
     broadcastToAll({
@@ -125,14 +254,14 @@ wss.on('connection', (ws, req) => {
 // Helper function to broadcast to all clients in a specific conversation
 function broadcastToConversation(conversationId, data, sender) {
   if (!conversationId) return;
-  
+
   const messageStr = JSON.stringify(data);
   let sentCount = 0;
-  
+
   clients.forEach((clientInfo, client) => {
-    if (client !== sender && 
-        client.readyState === WebSocket.OPEN && 
-        clientInfo.conversationId === conversationId) {
+    if (client !== sender &&
+      client.readyState === WebSocket.OPEN &&
+      clientInfo.conversationId === conversationId) {
       try {
         client.send(messageStr);
         sentCount++;
@@ -141,7 +270,7 @@ function broadcastToConversation(conversationId, data, sender) {
       }
     }
   });
-  
+
   console.log(`📤 Broadcasted to ${sentCount} clients in conversation ${conversationId}`);
 }
 
@@ -149,7 +278,7 @@ function broadcastToConversation(conversationId, data, sender) {
 function broadcastToAll(data, sender) {
   const messageStr = JSON.stringify(data);
   let sentCount = 0;
-  
+
   clients.forEach((clientInfo, client) => {
     if (client !== sender && client.readyState === WebSocket.OPEN) {
       try {
@@ -160,7 +289,7 @@ function broadcastToAll(data, sender) {
       }
     }
   });
-  
+
   console.log(`📤 Broadcasted to ${sentCount} clients`);
 }
 
