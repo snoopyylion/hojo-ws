@@ -6,8 +6,15 @@ const WebSocket = require('ws');
 const { createClient } = require('@supabase/supabase-js');
 const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 
-const wss = new WebSocket.Server({ port: 4001 }, () => {
-  console.log('✅ WebSocket server running on ws://localhost:4001');
+// Use Railway's PORT environment variable, fallback to 4001 for local development
+const PORT = process.env.PORT || 4001;
+const HOST = process.env.NODE_ENV === 'production' ? '0.0.0.0' : 'localhost';
+
+const wss = new WebSocket.Server({ 
+  port: PORT,
+  host: HOST 
+}, () => {
+  console.log(`✅ WebSocket server running on ${HOST}:${PORT}`);
 });
 
 // Store connected clients with their info
@@ -92,7 +99,7 @@ wss.on('connection', (ws, req) => {
   console.log('🔌 New client connected');
 
   // Extract conversation ID and user ID from URL if available
-  const url = new URL(req.url, 'http://localhost:4001');
+  const url = new URL(req.url, `http://${HOST}:${PORT}`);
   const conversationId = url.pathname.split('/conversations/')[1]?.split('?')[0];
   const userId = url.searchParams.get('userId');
 
@@ -302,5 +309,22 @@ setInterval(() => {
     }
   });
 }, 30000); // Clean up every 30 seconds
+
+// Graceful shutdown handling
+process.on('SIGTERM', () => {
+  console.log('📢 SIGTERM received, shutting down gracefully...');
+  wss.close(() => {
+    console.log('✅ WebSocket server closed');
+    process.exit(0);
+  });
+});
+
+process.on('SIGINT', () => {
+  console.log('📢 SIGINT received, shutting down gracefully...');
+  wss.close(() => {
+    console.log('✅ WebSocket server closed');
+    process.exit(0);
+  });
+});
 
 console.log('🚀 WebSocket server is ready to handle connections');
