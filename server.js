@@ -53,6 +53,21 @@ async function saveMessageNotificationsForAll(message) {
       });
     }
   }
+
+  // Also track message activity for the sender
+  await saveUserActivity({
+    user_id: message.sender_id,
+    type: 'message_sent',
+    title: 'Message Sent',
+    description: `You sent a message in conversation`,
+    category: 'social',
+    visibility: 'private',
+    data: {
+      conversation_id: message.conversation_id,
+      message_preview: message.content?.substring(0, 100) || 'Message sent',
+      recipient_count: participants.length - 1
+    }
+  });
 }
 
 async function saveNotification({ user_id, type, title, message, data }) {
@@ -82,6 +97,38 @@ async function saveNotification({ user_id, type, title, message, data }) {
     console.log('Notification save response:', res.status, text);
   } catch (error) {
     console.error('Failed to save notification:', error);
+  }
+}
+
+async function saveUserActivity({ user_id, type, title, description, category, visibility, data }) {
+  try {
+    const frontendApiUrl = process.env.FRONTEND_API_URL;
+    if (!frontendApiUrl) {
+      throw new Error('FRONTEND_API_URL is not set in environment variables');
+    }
+    const url = `${frontendApiUrl.replace(/\/$/, '')}/api/user-activity`;
+    console.log('Saving user activity to:', url);
+    const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-server-call': 'true',
+      },
+      body: JSON.stringify({
+        user_id,
+        type,
+        title,
+        description,
+        category,
+        visibility,
+        data,
+      }),
+    });
+    const text = await res.text();
+    console.log('User activity save response:', res.status, text);
+  } catch (error) {
+    console.error('Failed to save user activity:', error);
   }
 }
 
@@ -166,9 +213,34 @@ wss.on('connection', (ws, req) => {
               },
             });
 
-            // 2. Broadcast to the followed user if online
+            // 2. Send real-time notification update to the followed user if online
             const followedSocket = getSocketForUser(data.followedId);
             if (followedSocket) {
+              // Send the new notification format
+              followedSocket.send(JSON.stringify({
+                type: 'new_notification',
+                notification: {
+                  id: `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+                  user_id: data.followedId,
+                  type: 'follow',
+                  title: 'New Follower',
+                  message: `${data.followerName || 'Someone'} started following you!`,
+                  data: {
+                    actor_id: data.followerId,
+                    actor_name: data.followerName,
+                    target_type: 'user',
+                    target_id: data.followedId,
+                    action_url: `/user/${data.followerId}`,
+                    action_text: 'View Profile'
+                  },
+                  read: false,
+                  created_at: new Date().toISOString(),
+                  category: 'social',
+                  priority: 'medium'
+                }
+              }));
+
+              // Also send legacy format for compatibility
               const notification = {
                 type: 'follow_notification',
                 followerId: data.followerId,
@@ -190,24 +262,48 @@ wss.on('connection', (ws, req) => {
           // 1. Save notification for all participants (offline notification)
           await saveMessageNotificationsForAll(data.message);
 
-          // 2. Broadcast instant notification to all connected clients (except sender)
+          // 2. Send real-time notification updates to all connected clients
           clients.forEach((clientInfo, client) => {
             if (
-              clientInfo.conversationId === data.message.conversation_id &&
               clientInfo.userId !== data.message.sender_id &&
               client.readyState === WebSocket.OPEN
             ) {
+              // Send notification update
               client.send(JSON.stringify({
-                type: 'new_message',
-                senderName: data.message.sender?.username || 'Someone',
-                content: data.message.content,
-                conversationId: data.message.conversation_id,
-                messageId: data.message.id
+                type: 'new_notification',
+                notification: {
+                  id: `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+                  user_id: clientInfo.userId,
+                  type: 'message',
+                  title: `New message from ${data.message.sender?.first_name || data.message.sender?.username || 'Someone'}`,
+                  message: data.message.content?.substring(0, 100) || 'New message',
+                  data: {
+                    conversation_id: data.message.conversation_id,
+                    sender_id: data.message.sender_id,
+                    sender_name: data.message.sender?.first_name || data.message.sender?.username || 'Someone',
+                    message_preview: data.message.content
+                  },
+                  read: false,
+                  created_at: new Date().toISOString(),
+                  category: 'messaging',
+                  priority: 'high'
+                }
               }));
+
+              // Also send the message notification for conversation clients
+              if (clientInfo.conversationId === data.message.conversation_id) {
+                client.send(JSON.stringify({
+                  type: 'new_message',
+                  senderName: data.message.sender?.username || 'Someone',
+                  content: data.message.content,
+                  conversationId: data.message.conversation_id,
+                  messageId: data.message.id
+                }));
+              }
             }
           });
 
-          // 3. (Optional) Broadcast the message itself as you already do
+          // 3. Broadcast the message itself to conversation participants
           broadcastToConversation(data.message?.conversation_id, data, ws);
           break;
 
